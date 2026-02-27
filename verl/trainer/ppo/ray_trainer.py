@@ -244,6 +244,23 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.EGPO:
+        # EGPO: GRPO + clipped entropy bonus (Hao et al. 2025, function calling)
+        assert "entropys" in data.batch, (
+            "EGPO requires token-level entropy. Ensure calculate_entropy=True when "
+            "computing old_log_probs (e.g. adv_estimator=egpo triggers this)."
+        )
+        advantages, returns = core_algos.compute_egpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            token_level_entropy=data.batch["entropys"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        data.batch.pop("entropys", None)  # no longer needed after advantage
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1452,6 +1469,9 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            # EGPO needs token-level entropy for advantage (legacy path reads meta_info)
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.EGPO:
+                                batch.meta_info["calculate_entropy"] = True
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1467,7 +1487,20 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
+                            # Keep entropys in batch when using EGPO (needed for advantage)
+                            if self.config.algorithm.adv_estimator != AdvantageEstimator.EGPO:
+                                old_log_prob.batch.pop("entropys")
+                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                                router_replay = getattr(
+                                    self.config.actor_rollout_ref.actor, "router_replay", None
+                                )
+                                router_mode = (
+                                    getattr(router_replay, "mode", "disabled") if router_replay else "disabled"
+                                )
+                                if router_mode == "R2":
+                                    batch.batch.pop("routed_experts")
+                                else:
+                                    old_log_prob.batch.pop("routed_experts")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.

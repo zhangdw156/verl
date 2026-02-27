@@ -105,6 +105,9 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    EGPO = "egpo"  # Entropy-Guided Policy Optimization (Hao et al. 2025, function calling)
+    OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
+    TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -353,6 +356,68 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.EGPO)
+def compute_egpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    token_level_entropy: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    egpo_lambda: float = 0.4,
+    egpo_alpha: float = 2.0,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute EGPO (Entropy-Guided Policy Optimization) advantage for function calling.
+
+    EGPO augments GRPO advantage with a clipped entropy bonus from the model's
+    Chain-of-Thought to encourage diverse reasoning while keeping optimization direction.
+    Reference: Reasoning through Exploration: A Reinforcement Learning Framework for
+    Robust Function Calling (Hao et al., 2025, arXiv:2508.05118).
+
+    Formula: A_i^EGPO = A_i + lambda * clip(H_i, -|A_i|/alpha, |A_i|/alpha)
+    where A_i is GRPO advantage and H_i is mean token entropy over the response (or CoT).
+
+    Args:
+        token_level_rewards: (bs, response_length)
+        response_mask: (bs, response_length)
+        index: (bs,) group id per sample (uid)
+        token_level_entropy: (bs, response_length) token-level entropy from current policy
+        epsilon: small constant for std
+        norm_adv_by_std_in_grpo: whether to normalize GRPO advantage by std
+        egpo_lambda: weight for entropy term (default 0.4)
+        egpo_alpha: clipping threshold, alpha > 1 (default 2.0)
+        config: optional AlgoConfig (egpo_lambda/egpo_alpha can override from config)
+
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length)
+    """
+    if config is not None:
+        egpo_lambda = config.get("egpo_lambda", egpo_lambda)
+        egpo_alpha = config.get("egpo_alpha", egpo_alpha)
+    # 1) GRPO advantage (scalar per sample, then broadcast)
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        g = as_torch_index(index, device=scores.device)
+        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+        if norm_adv_by_std_in_grpo:
+            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+        else:
+            scalars = scores - mean_g[g]
+        # scalars: (bs,), same as A_i per sample
+        # 2) Per-sample mean entropy H_i over response (masked)
+        H_i = verl_F.masked_mean(token_level_entropy, response_mask, axis=-1)  # (bs,)
+        # 3) Clip entropy so it does not flip sign of A_i: clip(H_i, -|A_i|/alpha, |A_i|/alpha)
+        A_i = scalars
+        bound = torch.abs(A_i) / egpo_alpha
+        entropy_bonus = torch.clamp(H_i, -bound, bound)
+        # 4) A_egpo_i = A_i + lambda * entropy_bonus, then broadcast to tokens
+        scalars_egpo = A_i + egpo_lambda * entropy_bonus
+        advantages = scalars_egpo.unsqueeze(-1) * response_mask
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

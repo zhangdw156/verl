@@ -459,8 +459,10 @@ class AlgoConfig(BaseConfig):
     Args:
         gamma (float): Discount factor for future rewards.
         lam (float): Trade-off between bias and variance in the GAE estimator.
-        adv_estimator (str): Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
+        adv_estimator (str): Advantage estimator type: "gae", "grpo", "egpo", "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        egpo_lambda (float): EGPO entropy bonus weight (default 0.4). Used when adv_estimator="egpo".
+        egpo_alpha (float): EGPO entropy clip threshold, alpha>1 (default 2.0). Used when adv_estimator="egpo".
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -487,6 +489,8 @@ class AlgoConfig(BaseConfig):
     lam: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    egpo_lambda: float = 0.4
+    egpo_alpha: float = 2.0
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

@@ -102,6 +102,15 @@ def default_compute_score(
         from . import search_r1_like_qa_em
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
+    elif data_source in [
+        "function_calling",
+        "bfcl",
+        "xlam-function-calling",
+        "open_agentic_tool_use",
+    ]:
+        from . import function_calling
+
+        res = function_calling.compute_score(solution_str, ground_truth)
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
