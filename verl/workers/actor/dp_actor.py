@@ -425,6 +425,9 @@ class DataParallelPPOActor(BasePPOActor):
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
+        When meta_info["calculate_entropy"] is True (e.g. for EGPO advantage), entropy is computed
+        even if entropy_coeff is 0.
+
         Args:
             data (DataProto): a DataProto containing keys
 
@@ -444,6 +447,8 @@ class DataParallelPPOActor(BasePPOActor):
                 - ``sum_pi_squared``: tensor of shape [batch_size, response_length]. torch.float32.
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+        # e.g. EGPO needs entropy for advantage; trainer sets meta_info["calculate_entropy"]
+        calculate_entropy = calculate_entropy or data.meta_info.get("calculate_entropy", False)
 
         # set to eval
         self.actor_module.eval()
