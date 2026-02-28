@@ -1,0 +1,96 @@
+# EGPO 算法配置（在 verl_common_config 基础上改）
+# 与 GRPO 的主要区别：adv_estimator=egpo，并增加 egpo_lambda / egpo_alpha；reward 需为严格二元（见 reward_fn_egpo.py）
+algorithm:
+  adv_estimator: egpo
+  norm_adv_by_std_in_grpo: true
+  egpo_lambda: 0.4
+  egpo_alpha: 2.0
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+
+# 数据与 GRPO 共用同一套
+data:
+  train_files: /dfs/data/work/hardtry/data/looptool/train.parquet
+  val_files: /dfs/data/work/hardtry/data/looptool/test.parquet
+  train_batch_size: 64
+  val_batch_size: 64
+  max_prompt_length: 9216
+  max_response_length: 1024
+  truncation: 'left'
+  return_raw_chat: true
+  filter_overlong_prompts: true
+
+actor_rollout_ref:
+  num_workers: 2
+  model_sharing: true
+  load_on_worker: false
+  model:
+    path: /dfs/data/models/Qwen3-4B-Instruct-2507
+    use_remove_padding: true
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+  actor:
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: true
+    optim:
+      lr: 1e-6
+      weight_decay: 1e-4
+    fsdp_config:
+      optimizer_offload: true
+      param_offload: true
+    clip_ratio_low: 0.20
+    clip_ratio_high: 0.28
+    kl_loss_coef: 0.001
+    entropy_coeff: 0  # EGPO 的熵只用于 advantage，不放在 loss 里
+    kl_loss_type: low_var_kl
+    strategy: fsdp
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    strategy: fsdp
+    fsdp_config:
+      optimizer_offload: true
+      param_offload: true
+  rollout:
+    name: vllm
+    n: 4
+    gpu_memory_utilization: 0.6
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    dtype: bfloat16
+
+trainer:
+  project_name: hardtry
+  n_gpus_per_node: 2
+  nnodes: 1
+  logger: ['console', 'swanlab']
+  critic_warmup: 0.01
+  save_freq: 50
+  test_freq: 50
+  max_checkpoint_limit: 2
+  val_before_train: true
+  total_epochs: 1
+  resume_mode: auto
+
+# EGPO 使用严格二元 reward，需指向 reward_fn_egpo.py
+custom_reward_function:
+  path: /dfs/data/work/hardtry/src/hardtry/rl/reward_fn_egpo.py
+  name: compute_score
+
+ray_init_kwargs:
+  runtime_env:
+    env_vars:
+      PATH: "/dfs/data/uv-venv/verl/bin:/usr/local/bin:/usr/bin:/bin"
+      VIRTUAL_ENV: "/dfs/data/uv-venv/verl"
+      RAY_memory_usage_threshold: 0.85
+      RAY_memory_monitor_refresh_ms: 5000
+      TOKENIZERS_PARALLELISM: "false"
+      NCCL_DEBUG: "WARN"
+      VLLM_LOGGING_LEVEL: "ERROR"
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "true"
+      VLLM_ALLREDUCE_USE_SYMM_MEM: "0"
+      CUDA_DEVICE_MAX_CONNECTIONS: "8"
+      NCCL_CUMEM_ENABLE: "1"
+  working_dir: /dfs/data/work/hardtry

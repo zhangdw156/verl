@@ -1,0 +1,14 @@
+# EGPO 主配置：继承 ppo_trainer + 公共配置，实验名为 egpo
+defaults:
+  - ppo_trainer
+  - verl_common_config_egpo
+  - _self_
+
+trainer:
+  experiment_name: verl6_egpo
+  default_local_dir: /dfs/data/work/hardtry/checkpoints/verl6_egpo
+
+hydra:
+  searchpath:
+    - pkg://verl/trainer/config/
+    - file:///dfs/data/work/hardtry/exps/verl6/configs/
