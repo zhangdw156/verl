@@ -250,11 +250,19 @@ def compute_advantage(
             "EGPO requires token-level entropy. Ensure calculate_entropy=True when "
             "computing old_log_probs (e.g. adv_estimator=egpo triggers this)."
         )
+        assert "responses" in data.batch, (
+            "EGPO requires 'responses' field in batch to create CoT mask. "
+            "This field should be present after rollout generation. "
+            "If using async rollout, ensure the rollout implementation returns 'responses' field."
+        )
+        # Get responses for CoT mask creation (required for EGPO)
+        responses = data.batch["responses"]
         advantages, returns = core_algos.compute_egpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
             index=data.non_tensor_batch["uid"],
             token_level_entropy=data.batch["entropys"],
+            responses=responses,  # Required for CoT mask creation
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
         )

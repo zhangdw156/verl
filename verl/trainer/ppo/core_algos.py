@@ -358,12 +358,59 @@ def compute_grpo_vectorized_outcome_advantage(
         return advantages, advantages
 
 
+def _create_cot_mask_from_redacted_reasoning(
+    responses: torch.Tensor,  # (bs, response_length)
+    response_mask: torch.Tensor,  # (bs, response_length)
+    start_token_id: int = 151667,  # `<think>` for Qwen3
+    end_token_id: int = 151668,  # `</think>` for Qwen3
+) -> torch.Tensor:
+    """Create CoT mask, identifying all tokens between `<think>` and `</think>`.
+
+    Assumes each response contains exactly one `<think>` and one `</think>` pair.
+
+    Args:
+        responses: Response token ids, shape (bs, response_length)
+        response_mask: Response mask, shape (bs, response_length)
+        start_token_id: `<think>` token id (151667 for Qwen3)
+        end_token_id: `</think>` token id (151668 for Qwen3)
+
+    Returns:
+        cot_mask: CoT mask, shape (bs, response_length), 1 for CoT tokens, 0 otherwise
+    """
+    batch_size, seq_len = responses.shape
+    cot_mask = torch.zeros_like(response_mask, dtype=torch.long)
+
+    for i in range(batch_size):
+        # Find the first `<think>` and `</think>` positions
+        start_positions = (responses[i] == start_token_id).nonzero(as_tuple=True)[0]
+        end_positions = (responses[i] == end_token_id).nonzero(as_tuple=True)[0]
+
+        # Use only the first start and end token pair
+        if len(start_positions) > 0 and len(end_positions) > 0:
+            start_idx = start_positions[0].item()
+            # Find the first end_idx after start_idx
+            end_candidates = end_positions[end_positions > start_idx]
+            if len(end_candidates) > 0:
+                end_idx = end_candidates[0].item()
+                # Mark all tokens from start_idx to end_idx (inclusive)
+                # This includes the start and end tokens themselves
+                cot_mask[i, start_idx : end_idx + 1] = 1
+
+    # Only keep CoT tokens that are within response_mask
+    cot_mask = cot_mask * response_mask
+
+    return cot_mask
+
+
 @register_adv_est(AdvantageEstimator.EGPO)
 def compute_egpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
     token_level_entropy: torch.Tensor,
+    responses: torch.Tensor,  # Required: for CoT mask creation
+    cot_start_token_id: int = 151667,  # `<think>` for Qwen3
+    cot_end_token_id: int = 151668,  # `</think>` for Qwen3
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     egpo_lambda: float = 0.4,
@@ -378,18 +425,21 @@ def compute_egpo_outcome_advantage(
     Robust Function Calling (Hao et al., 2025, arXiv:2508.05118).
 
     Formula: A_i^EGPO = A_i + lambda * clip(H_i, -|A_i|/alpha, |A_i|/alpha)
-    where A_i is GRPO advantage and H_i is mean token entropy over the response (or CoT).
+    where A_i is GRPO advantage and H_i is mean token entropy over the CoT.
 
     Args:
         token_level_rewards: (bs, response_length)
         response_mask: (bs, response_length)
         index: (bs,) group id per sample (uid)
         token_level_entropy: (bs, response_length) token-level entropy from current policy
+        responses: (bs, response_length) Required response token ids for CoT mask creation
+        cot_start_token_id: Start token id for CoT (151667 for Qwen3 `<think>`)
+        cot_end_token_id: End token id for CoT (151668 for Qwen3 `</think>`)
         epsilon: small constant for std
         norm_adv_by_std_in_grpo: whether to normalize GRPO advantage by std
         egpo_lambda: weight for entropy term (default 0.4)
         egpo_alpha: clipping threshold, alpha > 1 (default 2.0)
-        config: optional AlgoConfig (egpo_lambda/egpo_alpha can override from config)
+        config: optional AlgoConfig (egpo_lambda/egpo_alpha/cot_start_token_id/cot_end_token_id can override from config)
 
     Returns:
         advantages: (bs, response_length)
@@ -398,6 +448,8 @@ def compute_egpo_outcome_advantage(
     if config is not None:
         egpo_lambda = config.get("egpo_lambda", egpo_lambda)
         egpo_alpha = config.get("egpo_alpha", egpo_alpha)
+        cot_start_token_id = config.get("cot_start_token_id", cot_start_token_id)
+        cot_end_token_id = config.get("cot_end_token_id", cot_end_token_id)
     # 1) GRPO advantage (scalar per sample, then broadcast)
     with torch.no_grad():
         scores = token_level_rewards.sum(dim=-1)
@@ -408,13 +460,19 @@ def compute_egpo_outcome_advantage(
         else:
             scalars = scores - mean_g[g]
         # scalars: (bs,), same as A_i per sample
-        # 2) Per-sample mean entropy H_i over response (masked)
-        H_i = verl_F.masked_mean(token_level_entropy, response_mask, axis=-1)  # (bs,)
-        # 3) Clip entropy so it does not flip sign of A_i: clip(H_i, -|A_i|/alpha, |A_i|/alpha)
+        # 2) Create CoT mask from responses (required for EGPO)
+        cot_mask = _create_cot_mask_from_redacted_reasoning(
+            responses, response_mask, cot_start_token_id, cot_end_token_id
+        )
+        # Only compute entropy over CoT part
+        cot_entropy_mask = response_mask * cot_mask  # Must be both in response and CoT
+        # 3) Per-sample mean entropy H_i over CoT (masked)
+        H_i = verl_F.masked_mean(token_level_entropy, cot_entropy_mask, axis=-1)  # (bs,)
+        # 4) Clip entropy so it does not flip sign of A_i: clip(H_i, -|A_i|/alpha, |A_i|/alpha)
         A_i = scalars
         bound = torch.abs(A_i) / egpo_alpha
         entropy_bonus = torch.clamp(H_i, -bound, bound)
-        # 4) A_egpo_i = A_i + lambda * entropy_bonus, then broadcast to tokens
+        # 5) A_egpo_i = A_i + lambda * entropy_bonus, then broadcast to tokens
         scalars_egpo = A_i + egpo_lambda * entropy_bonus
         advantages = scalars_egpo.unsqueeze(-1) * response_mask
     return advantages, advantages
