@@ -13,7 +13,7 @@
 
 - **EGPO 熵增强 advantage**:
   $$A_i^{\text{EGPO}} = A_i + \lambda \cdot \text{clip}\left(H_i,\ -\frac{|A_i|}{\alpha},\ \frac{|A_i|}{\alpha}\right)$$
-  - \(H_i\): 第 \(i\) 条 rollout 的 **CoT 熵**（可先简化为整条 response 在 mask 下的平均 token 熵）
+  - \(H_i\): 第 \(i\) 条 rollout 的 **CoT 熵**（仅计算 Chain-of-Thought 部分的平均 token 熵，使用 Qwen3 的 `<think>` 和 `</think>` token 标记）
   - \(\lambda > 0\): 熵权重（论文 \(\lambda=0.4\)）
   - \(\alpha > 1\): 裁剪阈值（论文 \(\alpha=2\)），保证熵项不会反转 \(A_i\) 的符号
 
@@ -43,25 +43,30 @@
 - **位置**: `verl/trainer/ppo/core_algos.py`
 - **步骤**:
   1. 用现有 GRPO 逻辑算出 \(A_i\)（per-sample 标量，再 broadcast 到 token 维）。
-  2. 从 `data.batch["entropys"]` 得到 token 级熵 `(bs, response_length)`，在 `response_mask` 下对每个 sample 求平均，得到 \(H_i\)，shape `(bs,)`。
-  3. 对每个 sample：  
+  2. 从 `data.batch["responses"]` 创建 CoT mask：使用 `_create_cot_mask_from_redacted_reasoning()` 函数，识别 Qwen3 的 `<think>` (token ID 151667) 和 `</think>` (token ID 151668) 之间的 token。
+  3. 从 `data.batch["entropys"]` 得到 token 级熵 `(bs, response_length)`，在 **CoT mask** 下对每个 sample 求平均，得到 \(H_i\)，shape `(bs,)`。
+  4. 对每个 sample：  
      `A_egpo_i = A_i + lambda * clip(H_i, -|A_i|/alpha, |A_i|/alpha)`  
      再按 token 维 broadcast 并乘 `response_mask`。
 - **配置**: 在 `AlgoConfig`（或等价 algorithm config）中增加：
   - `egpo_lambda: float = 0.4`
   - `egpo_alpha: float = 2.0`
+  - `cot_start_token_id: int = 151667`（Qwen3 的 `<think>` token ID）
+  - `cot_end_token_id: int = 151668`（Qwen3 的 `</think>` token ID）
   - `adv_estimator: str = "egpo"` 时使用上述逻辑。
 
-#### 2.2 保证 batch 中有 `entropys`
+#### 2.2 保证 batch 中有 `entropys` 和 `responses`
 
-- **当前行为**: `_compute_old_log_prob` 已可返回 `entropys`；在 fit 里为了指标会做一次聚合，然后 `old_log_prob.batch.pop("entropys")`，再 `batch.union(old_log_prob)`，导致合并后的 batch 没有 `entropys`。
-- **修改**: 当 `adv_estimator == "egpo"` 时 **不要** 从 `old_log_prob` 里 pop 掉 `entropys`，这样 `batch.union(old_log_prob)` 后 `batch.batch["entropys"]` 存在，供 `compute_advantage` 使用。
-- **Legacy actor 路径**: 若通过 `compute_log_prob(batch)` 且未显式传 `calculate_entropy`，需要在该路径下当 `adv_estimator == "egpo"` 时也请求熵（例如在 trainer 里根据 `self.config.algorithm.adv_estimator == "egpo"` 设置 `calculate_entropy=True` 或等价逻辑），保证 legacy 和 non-legacy 都能在 EGPO 下拿到 `entropys`。
+- **entropys**: `_compute_old_log_prob` 已可返回 `entropys`；在 fit 里为了指标会做一次聚合，然后 `old_log_prob.batch.pop("entropys")`，再 `batch.union(old_log_prob)`，导致合并后的 batch 没有 `entropys`。
+  - **修改**: 当 `adv_estimator == "egpo"` 时 **不要** 从 `old_log_prob` 里 pop 掉 `entropys`，这样 `batch.union(old_log_prob)` 后 `batch.batch["entropys"]` 存在，供 `compute_advantage` 使用。
+  - **Legacy actor 路径**: 若通过 `compute_log_prob(batch)` 且未显式传 `calculate_entropy`，需要在该路径下当 `adv_estimator == "egpo"` 时也请求熵（例如在 trainer 里根据 `self.config.algorithm.adv_estimator == "egpo"` 设置 `calculate_entropy=True` 或等价逻辑），保证 legacy 和 non-legacy 都能在 EGPO 下拿到 `entropys`。
+- **responses**: `responses` 字段在 rollout 生成后就已经存在于 `data.batch` 中。各种 rollout 实现（naive_rollout、hf_rollout、agent_loop 等）都会返回包含 `responses` 的 DataProto。
+  - **修改**: 在 `compute_advantage` 的 EGPO 分支中添加断言检查，确保 `responses` 字段存在，如果不存在则报错终止（不提供向后兼容，确保算法正确性）。
 
 #### 2.3 Reward 与数据
 
 - **Single-Criteria 二元 reward**: 已实现于 `verl.utils.reward_score.function_calling`：格式（CoT + tool-call 模式）与正确性（与 ground_truth 归一化比较）均通过则 1.0，否则 0.0；数据中 `data_source` 设为 `function_calling` 等即可接入。
-- **CoT 区域（可选细化）**: 论文写的是 “entropy of the model’s Chain-of-Thought”。若数据里 CoT 有明确边界（如 `<thinking>...</thinking>`），可后续增加可选的 `cot_mask`，只在 CoT 位置上平均熵得到 \(H_i\)；首版复现可简化为 **整条 response 在 response_mask 下的平均熵**。
+- **CoT 区域识别**: 论文写的是 "entropy of the model's Chain-of-Thought"。实现中已通过 `_create_cot_mask_from_redacted_reasoning()` 函数识别 CoT 区域，使用 Qwen3 的 `<think>` (token ID 151667) 和 `</think>` (token ID 151668) token 标记。只计算 CoT 部分的熵，符合论文规范。
 
 ### 3. 配置与入口
 
@@ -84,13 +89,15 @@
 
 1. **core_algos.py**
    - 增加 `AdvantageEstimator.EGPO`。
-   - 实现 `compute_egpo_outcome_advantage(token_level_rewards, response_mask, index, token_level_entropy, egpo_lambda, egpo_alpha, norm_adv_by_std_in_grpo, ...)`：内部先调 GRPO 得 \(A_i\)，再算 \(H_i\) 与 clip，得到 EGPO advantage 与 returns。
+   - 实现 `_create_cot_mask_from_redacted_reasoning()` 辅助函数：从 `responses` 中识别 CoT 区域（使用 Qwen3 的 `<think>` 和 `</think>` token）。
+   - 实现 `compute_egpo_outcome_advantage(token_level_rewards, response_mask, index, token_level_entropy, responses, cot_start_token_id, cot_end_token_id, egpo_lambda, egpo_alpha, norm_adv_by_std_in_grpo, ...)`：内部先调 GRPO 得 \(A_i\)，再创建 CoT mask，在 CoT 区域计算 \(H_i\) 与 clip，得到 EGPO advantage 与 returns。
 
 2. **algorithm config**
    - 增加 `egpo_lambda: float = 0.4`、`egpo_alpha: float = 2.0`（或从 config 的 get 读取）。
 
 3. **ray_trainer.py（及同逻辑 trainer）**
-   - 在 `compute_advantage` 中为 `adv_estimator == "egpo"` 增加分支，传入 `data.batch["entropys"]` 与 egpo 超参。
+   - 在 `compute_advantage` 中为 `adv_estimator == "egpo"` 增加分支，传入 `data.batch["entropys"]`、`data.batch["responses"]` 与 egpo 超参。
+   - 添加断言检查，确保 `responses` 字段存在（不提供向后兼容，确保算法正确性）。
    - 当 `adv_estimator == "egpo"` 时，**不要** 对 `old_log_prob.batch` 执行 `pop("entropys")`，以便 `entropys` 进入合并后的 batch。
    - Legacy 路径下，当 `adv_estimator == "egpo"` 时确保调用 actor 的 `compute_log_prob` 时带有 `calculate_entropy=True`（或等价配置）。
 
@@ -106,10 +113,13 @@
 
 ## 已实现改动摘要（verl 代码库）
 
-- **`verl/trainer/ppo/core_algos.py`**: 新增 `AdvantageEstimator.EGPO` 与 `compute_egpo_outcome_advantage()`，先算 GRPO advantage，再按论文公式加上裁剪后的熵项。
-- **`verl/trainer/config/algorithm.py`**: `AlgoConfig` 增加 `egpo_lambda`（默认 0.4）、`egpo_alpha`（默认 2.0）。
+- **`verl/trainer/ppo/core_algos.py`**: 
+  - 新增 `_create_cot_mask_from_redacted_reasoning()` 辅助函数，用于从 Qwen3 的 `<think>` 和 `</think>` token 创建 CoT mask。
+  - 新增 `AdvantageEstimator.EGPO` 与 `compute_egpo_outcome_advantage()`，先算 GRPO advantage，再创建 CoT mask，在 CoT 区域计算熵并按论文公式加上裁剪后的熵项。
+- **`verl/trainer/config/algorithm.py`**: `AlgoConfig` 增加 `egpo_lambda`（默认 0.4）、`egpo_alpha`（默认 2.0）、`cot_start_token_id`（默认 151667）、`cot_end_token_id`（默认 151668）。
 - **`verl/trainer/ppo/ray_trainer.py`**:  
-  - `compute_advantage()` 中增加 EGPO 分支，传入 `entropys` 与 config；  
+  - `compute_advantage()` 中增加 EGPO 分支，传入 `entropys`、`responses` 与 config；  
+  - 添加断言检查，确保 `responses` 字段存在；  
   - 当 `adv_estimator == EGPO` 时不再从 `old_log_prob` 中 `pop("entropys")`，并在计算完 advantage 后从 `data.batch` 中 `pop("entropys")`；  
   - 在 recompute old_log_prob 前设置 `batch.meta_info["calculate_entropy"] = True`（供 legacy actor 使用）。
 - **`verl/workers/actor/dp_actor.py`**: `compute_log_prob()` 中增加对 `data.meta_info.get("calculate_entropy", False)` 的读取，以便 EGPO 在 legacy 路径下也能拿到 token 级熵。
@@ -122,6 +132,8 @@ algorithm:
   norm_adv_by_std_in_grpo: true
   egpo_lambda: 0.4
   egpo_alpha: 2.0
+  cot_start_token_id: 151667  # Qwen3 的 <think> token ID
+  cot_end_token_id: 151668    # Qwen3 的 </think> token ID
 ```
 
 **Reward**: 已实现。数据中 `data_source`（或 reward_fn_key）设为 `function_calling`、`bfcl`、`xlam-function-calling`、`open_agentic_tool_use` 之一即可使用 `verl.utils.reward_score.function_calling.compute_score`（Single-Criteria 二元：格式 + 正确性通过才 1.0，否则 0.0）。
