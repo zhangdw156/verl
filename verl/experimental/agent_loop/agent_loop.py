@@ -596,6 +596,8 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            if agent_name == "bfcl_v4_multi_turn":
+                kwargs["_verl_validate"] = trajectory["validate"]
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 

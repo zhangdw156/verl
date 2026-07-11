@@ -15,12 +15,14 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import hashlib
 import os
 import socket
+from pathlib import Path
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -30,6 +32,31 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import deprecated
+
+
+def _embed_bfcl_handler_source(config) -> None:
+    """Embed the independent BFCL handler file into the Ray-distributed config."""
+    bfcl_config = config.data.get("bfcl_v4", {})
+    if not bfcl_config.get("enabled", False):
+        return
+    handler_config = bfcl_config.get("handler", {})
+    handler_path = handler_config.get("path")
+    if not handler_path:
+        raise ValueError("data.bfcl_v4.handler.path must point to an independent Python handler file")
+
+    if handler_path.startswith("file://"):
+        handler_path = handler_path[len("file://") :]
+    path = Path(handler_path).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"BFCL handler file not found: {path}")
+
+    source = path.read_text(encoding="utf-8")
+    with open_dict(handler_config):
+        handler_config.path = str(path)
+        handler_config.source = source
+        handler_config.source_sha256 = hashlib.sha256(source.encode()).hexdigest()
 
 
 @deprecated(
@@ -58,6 +85,8 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    _embed_bfcl_handler_source(config)
+
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
@@ -331,7 +360,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     from verl.utils.dataset.rl_dataset import get_dataset_class
 
     # Get the dataset class
-    dataset_cls = get_dataset_class(data_config)
+    dataset_cls = get_dataset_class(data_config, is_train=is_train)
 
     # Instantiate the dataset using the determined dataset class
     dataset = dataset_cls(

@@ -42,6 +42,7 @@ from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_bfcl_v4_multi_turn_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -384,6 +385,7 @@ class RayPPOTrainer:
                 self.config.data,
                 self.tokenizer,
                 self.processor,
+                is_train=True,
                 max_samples=self.config.data.get("train_max_samples", -1),
             )
         if val_dataset is None:
@@ -392,6 +394,7 @@ class RayPPOTrainer:
                 self.config.data,
                 self.tokenizer,
                 self.processor,
+                is_train=False,
                 max_samples=self.config.data.get("val_max_samples", -1),
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
@@ -723,6 +726,8 @@ class RayPPOTrainer:
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        bfcl_metrics = compute_bfcl_v4_multi_turn_metrics(data_sources, reward_extra_infos_dict)
+        bfcl_official = "val-core/bfcl_v4_multi_turn/overall/accuracy" in bfcl_metrics
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -737,6 +742,8 @@ class RayPPOTrainer:
                         metric_sec = "val-core"
                     else:
                         metric_sec = "val-aux"
+                    if str(data_source).startswith("bfcl_v4/") and not bfcl_official:
+                        metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
@@ -746,6 +753,7 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        metric_dict.update(bfcl_metrics)
         return metric_dict
 
     def _merge_validation_results(self, result_a, result_b):

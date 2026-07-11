@@ -700,3 +700,56 @@ def process_validation_metrics(
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
     return data_src2var2metric2val
+
+
+def compute_bfcl_v4_multi_turn_metrics(
+    data_sources: list[str] | np.ndarray,
+    infos_dict: dict[str, list[Any]],
+) -> dict[str, float]:
+    """Compute the official unweighted BFCLv4 multi-turn overall accuracy."""
+    category_sources = {
+        "multi_turn_base": "bfcl_v4/multi_turn_base",
+        "multi_turn_miss_func": "bfcl_v4/multi_turn_miss_func",
+        "multi_turn_miss_param": "bfcl_v4/multi_turn_miss_param",
+        "multi_turn_long_context": "bfcl_v4/multi_turn_long_context",
+    }
+    normalized_sources = [str(source) for source in data_sources]
+    present_sources = set(normalized_sources) & set(category_sources.values())
+    if not present_sources:
+        return {}
+
+    accuracies = infos_dict.get("acc")
+    if accuracies is None:
+        raise ValueError("BFCLv4 validation samples must provide `acc` in reward_extra_info")
+    if len(accuracies) != len(normalized_sources):
+        raise ValueError(
+            f"BFCLv4 validation has {len(normalized_sources)} data sources but {len(accuracies)} accuracy values"
+        )
+
+    category_metrics = {}
+    category_counts = {}
+    for category, source in category_sources.items():
+        values = [
+            float(accuracy)
+            for data_source, accuracy in zip(normalized_sources, accuracies, strict=True)
+            if data_source == source
+        ]
+        if not values:
+            continue
+        category_metrics[category] = float(np.mean(values))
+        category_counts[category] = len(values)
+
+    is_official = set(category_metrics) == set(category_sources) and all(
+        count == 200 for count in category_counts.values()
+    )
+    if is_official:
+        result = {
+            f"val-core/bfcl_v4_multi_turn/{category}/accuracy": value for category, value in category_metrics.items()
+        }
+        result["val-core/bfcl_v4_multi_turn/overall/accuracy"] = float(np.mean(list(category_metrics.values())))
+        return result
+
+    return {
+        "val-aux/bfcl_v4_multi_turn/partial/accuracy": float(np.mean(list(category_metrics.values()))),
+        "val-aux/bfcl_v4_multi_turn/partial/coverage": sum(category_counts.values()) / 800,
+    }

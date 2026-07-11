@@ -532,15 +532,37 @@ class RLHFDataset(Dataset):
         return splits
 
 
-def get_dataset_class(data_config: DictConfig):
+def get_dataset_class(data_config: DictConfig, is_train: Optional[bool] = None):
     """Get RLHF dataset class.
 
     Args:
         data_config: The data config.
+        is_train: Whether the dataset is used for training. ``None`` preserves
+            the legacy global custom class behavior.
 
     Returns:
         dataset_cls: The dataset class.
     """
+
+    split_custom_cls = None
+    if is_train is not None:
+        split_custom_cls = data_config.get("train_custom_cls" if is_train else "val_custom_cls")
+    if split_custom_cls and split_custom_cls.get("path"):
+        dataset_cls = load_extern_object(split_custom_cls.path, split_custom_cls.name)
+        if not issubclass(dataset_cls, Dataset):
+            raise TypeError(
+                f"The split-specific dataset class '{split_custom_cls.name}' from "
+                f"'{split_custom_cls.path}' must inherit from torch.utils.data.Dataset"
+            )
+        print(f"Using dataset class: {dataset_cls.__name__}")
+        return dataset_cls
+
+    if is_train is False and data_config.get("bfcl_v4", {}).get("enabled", False):
+        from verl.utils.dataset.bfcl_v4_dataset import BFCLV4MultiTurnDataset
+
+        dataset_cls = BFCLV4MultiTurnDataset
+        print(f"Using dataset class: {dataset_cls.__name__}")
+        return dataset_cls
 
     # Check if a custom dataset class is specified in the data configuration
     # and if the path to the custom class is provided

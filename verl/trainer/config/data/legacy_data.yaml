@@ -109,6 +109,68 @@ custom_cls:
   # The name of the dataset class within the specified file.
   name: null
 
+# Optional custom dataset class used only for the training split.
+train_custom_cls:
+
+  # The path to the file containing the training dataset class.
+  path: null
+
+  # The name of the training dataset class.
+  name: null
+
+# Optional custom dataset class used only for the validation split.
+val_custom_cls:
+
+  # The path to the file containing the validation dataset class.
+  path: null
+
+  # The name of the validation dataset class.
+  name: null
+
+# Optional native BFCLv4 multi-turn validation from the raw benchmark files.
+bfcl_v4:
+
+  # Enable BFCLv4 as the validation dataset.
+  enabled: False
+
+  # Root containing BFCL_v4_multi_turn_*.json, possible_answer/, and multi_turn_func_doc/.
+  # If null, data.val_files must contain exactly one BFCL data root.
+  data_root: null
+
+  # Fail unless the complete four-category suite is present.
+  strict: True
+
+  # Expected number of examples in each official BFCLv4 multi-turn category.
+  expected_examples_per_category: 200
+
+  # The four official multi-turn categories.
+  categories:
+    - multi_turn_base
+    - multi_turn_miss_func
+    - multi_turn_miss_param
+    - multi_turn_long_context
+
+  # Independent model-specific BFCL handler file.
+  handler:
+
+    # Python file containing the handler class or factory.
+    path: null
+
+    # Object name exported by the handler file.
+    name: Handler
+
+    # Keyword arguments passed when constructing the handler.
+    kwargs: {}
+
+    # Embedded handler source populated by the driver before Ray initialization.
+    source: null
+
+    # SHA256 checksum for the embedded handler source.
+    source_sha256: null
+
+  # Maximum model/tool steps within one BFCL user turn.
+  max_steps_per_turn: 20
+
 # Whether to return multi-modal inputs in the dataset. Set to False if rollout generates new multi-modal inputs.
 return_multi_modal_inputs: True
 
