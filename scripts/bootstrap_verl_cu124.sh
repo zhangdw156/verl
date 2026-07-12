@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_PATH="${VENV_PATH:-/data/zhangdw12/venvs/verl-cu124}"
+VENV_PATH="${VENV_PATH:-/data/zhangdw12/work/uv-venv/verl-cu124}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 BFCL_SOURCE="${BFCL_SOURCE:-}"
 BFCL_WHEEL="${BFCL_WHEEL:-}"

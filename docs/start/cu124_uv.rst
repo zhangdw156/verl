@@ -42,7 +42,7 @@ The default virtual environment path is:
 
 .. code-block:: text
 
-   /data/zhangdw12/venvs/verl-cu124
+   /data/zhangdw12/work/uv-venv/verl-cu124
 
 Override it when necessary:
 
