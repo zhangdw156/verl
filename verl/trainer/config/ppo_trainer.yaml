@@ -109,6 +109,9 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Persistent online prompt sampling configuration
+  online_sampling: null
+
 # config for the trainer
 trainer:
 
@@ -190,6 +193,24 @@ trainer:
 
   # Maximum number of critic checkpoints to keep
   max_critic_ckpt_to_keep: null
+
+  # Optional validation-metric-driven checkpoint retained independently of recent checkpoints
+  best_checkpoint:
+
+    # Whether to retain the best validation checkpoint
+    enabled: False
+
+    # Exact validation metric key to monitor
+    metric: null
+
+    # Comparison mode: "max" or "min"
+    mode: max
+
+    # Minimum absolute improvement required to replace the current best
+    min_delta: 0.0
+
+    # Directory under trainer.default_local_dir used for best checkpoints
+    directory: best_checkpoint
 
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300

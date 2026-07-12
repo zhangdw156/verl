@@ -22,16 +22,19 @@ Differs from original PPO trainer in main_ppo.py:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
 from pprint import pprint
 from typing import Any
 
@@ -44,7 +47,7 @@ try:
     import transfer_queue as tq
     from transfer_queue import KVBatchMeta
 except ImportError:
-    print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
+    print("Please install TQ by calling `pip install TransferQueue==0.1.7` and try again.")
     from verl.utils.transferqueue_utils import KVBatchMeta, tq
 
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -68,8 +71,10 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
+from verl.trainer.config.algorithm import OnlineSamplingConfig
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
+from verl.trainer.online_sampling import OnlineSamplingController, RolloutObservation, SampleObservation
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -118,6 +123,94 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # ======================================= USER SECTION BEGIN =======================================
+
+
+def _sha256_file(path: str | os.PathLike | None) -> str | None:
+    if not path:
+        return None
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        return None
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_path_fingerprint(path: str | os.PathLike) -> dict[str, Any]:
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        return {"path": str(path)}
+    if resolved.is_file():
+        return {"path": str(resolved), "sha256": _sha256_file(resolved)}
+
+    entries = []
+    for child in sorted(resolved.iterdir(), key=lambda item: item.name):
+        if not child.is_file():
+            continue
+        stat = child.stat()
+        entry = {
+            "name": child.name,
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        if child.suffix == ".json":
+            entry["sha256"] = _sha256_file(child)
+        entries.append(entry)
+    raw = json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "path": str(resolved),
+        "manifest_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+    }
+
+
+def _as_python_list(value) -> list:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return value if isinstance(value, list) else list(value)
+
+
+def _parse_transfer_queue_key(key: str) -> tuple[str, int, int]:
+    fields = key.rsplit("_", 2)
+    if len(fields) != 3:
+        raise ValueError(f"Unexpected transfer-queue key format: {key}")
+    return fields[0], int(fields[1]), int(fields[2])
+
+
+def _online_sampling_state_semantics(
+    config: OnlineSamplingConfig,
+    *,
+    train_batch_size: int,
+    gen_batch_size: int,
+) -> dict[str, Any]:
+    """Return every configuration value that changes persistent sampler state."""
+
+    return {
+        "rollout_n": config.rollout_n,
+        "zero_variance_epsilon": config.zero_variance_epsilon,
+        "ema_alpha": config.ema_alpha,
+        "min_weight": config.min_weight,
+        "staleness_weight": config.staleness_weight,
+        "staleness_horizon": config.staleness_horizon,
+        "max_refill_rounds": config.max_refill_rounds,
+        "min_effective_batch_ratio": config.min_effective_batch_ratio,
+        "probe_batch_size": config.probe_batch_size,
+        "save_responses": config.save_responses,
+        "seed": config.seed,
+        "train_batch_size": train_batch_size,
+        "gen_batch_size": gen_batch_size,
+    }
+
+
+def _link_or_copy_file(source: str, destination: str) -> str:
+    """Hard-link immutable checkpoint files when possible, otherwise copy them."""
+
+    try:
+        os.link(source, destination)
+        return destination
+    except OSError:
+        return shutil.copy2(source, destination)
 
 
 def compute_advantage_for_multi_trajectories(
@@ -521,12 +614,40 @@ class PPOTrainer:
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
         self.replay_buffer = ReplayBuffer()
+        self.online_sampling_config: OnlineSamplingConfig | None = None
+        self.online_sampling_controller: OnlineSamplingController | None = None
+        self.best_checkpoint_value: float | None = None
+        self.best_checkpoint_step: int | None = None
+        self._validate_best_checkpoint_config()
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._init_tokenizer()
         self._init_dataloader()
         self._init_dump_executor()
+
+    def _validate_best_checkpoint_config(self) -> None:
+        config = self.config.trainer.get("best_checkpoint", {})
+        if not config.get("enabled", False):
+            return
+
+        actor_checkpoint = self.config.actor_rollout_ref.actor.get("checkpoint", {})
+        critic_config = self.config.get("critic") or {}
+        critic_checkpoint = critic_config.get("checkpoint", {})
+        actor_async = bool(actor_checkpoint.get("async_save", False))
+        critic_async = self.use_critic and bool(critic_checkpoint.get("async_save", False))
+        if actor_async or critic_async:
+            raise ValueError(
+                "trainer.best_checkpoint is incompatible with asynchronous checkpoint saving; "
+                "set actor/critic checkpoint.async_save=false"
+            )
+        actor_torchtitan = self.config.actor_rollout_ref.actor.get("torchtitan") is not None
+        critic_torchtitan = self.use_critic and critic_config.get("torchtitan") is not None
+        if actor_torchtitan or critic_torchtitan:
+            raise ValueError(
+                "trainer.best_checkpoint currently requires standard actor/critic checkpoint layouts "
+                "and does not support the TorchTitan checkpoint engine"
+            )
 
     def _init_tokenizer(self):
         """Initialize tokenizer."""
@@ -559,14 +680,22 @@ class PPOTrainer:
             max_samples=self.config.data.get("val_max_samples", -1),
         )
 
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=self.config.data["dataloader_num_workers"],
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=create_rl_sampler(self.config.data, self.train_dataset),
-        )
+        online_sampling_config = self.config.algorithm.get("online_sampling")
+        online_sampling_enabled = bool(online_sampling_config and online_sampling_config.get("enabled", False))
+        if online_sampling_enabled:
+            raw_config = OmegaConf.to_container(online_sampling_config, resolve=True)
+            self.online_sampling_config = OnlineSamplingConfig(**raw_config)
+            self.train_dataloader = None
+            self._init_online_sampling()
+        else:
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                num_workers=self.config.data["dataloader_num_workers"],
+                drop_last=True,
+                collate_fn=collate_fn,
+                sampler=create_rl_sampler(self.config.data, self.train_dataset),
+            )
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=self.config.data.val_batch_size or len(self.val_dataset),
@@ -581,9 +710,14 @@ class PPOTrainer:
         )
 
         # adjust total_training_steps
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
+        if online_sampling_enabled:
+            if self.config.trainer.total_training_steps is None:
+                raise ValueError("trainer.total_training_steps is required when algorithm.online_sampling.enabled=true")
+            total_training_steps = int(self.config.trainer.total_training_steps)
+        else:
+            total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+            if self.config.trainer.total_training_steps is not None:
+                total_training_steps = self.config.trainer.total_training_steps
         self.total_training_steps = total_training_steps
         logger.info(f"Total training steps: {self.total_training_steps}")
 
@@ -596,6 +730,66 @@ class PPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             logger.warning(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _init_online_sampling(self) -> None:
+        if self.config.algorithm.adv_estimator != core_algos.AdvantageEstimator.GRPO:
+            raise ValueError("Online sampling currently supports only the GRPO advantage estimator")
+        if self.online_sampling_config.rollout_n != self.config.actor_rollout_ref.rollout.n:
+            raise ValueError("algorithm.online_sampling.rollout_n must equal actor_rollout_ref.rollout.n")
+        if self.online_sampling_config.rollout_n < 2:
+            raise ValueError("algorithm.online_sampling.rollout_n must be at least 2")
+        if self.online_sampling_config.max_refill_rounds <= 0:
+            raise ValueError("algorithm.online_sampling.max_refill_rounds must be positive")
+        if not 0 < self.online_sampling_config.min_effective_batch_ratio <= 1:
+            raise ValueError("algorithm.online_sampling.min_effective_batch_ratio must be in (0, 1]")
+        sample_ids = getattr(self.train_dataset, "sample_ids", None)
+        if sample_ids is None:
+            raise TypeError("Online sampling requires the training dataset to expose a stable `sample_ids` sequence")
+        sample_ids = [str(sample_id) for sample_id in sample_ids]
+        if not sample_ids:
+            raise ValueError("Online sampling requires at least one eligible training sample")
+        if len(sample_ids) != len(self.train_dataset):
+            raise ValueError("train_dataset.sample_ids length must match the training dataset length")
+        sample_metadata = getattr(self.train_dataset, "sample_metadata", None)
+        dataset_fingerprint = getattr(self.train_dataset, "dataset_fingerprint", None)
+        reward_path = self.config.reward.custom_reward_function.get("path")
+        handler_config = self.config.data.get("bfcl_v4", {}).get("handler", {})
+        sample_ids_json = json.dumps(sample_ids, ensure_ascii=False, separators=(",", ":"))
+        sample_ids_sha256 = hashlib.sha256(sample_ids_json.encode()).hexdigest()
+        fingerprint = {
+            "dataset": dataset_fingerprint or sample_ids_sha256,
+            "sample_ids_sha256": sample_ids_sha256,
+            "model": _model_path_fingerprint(self.config.actor_rollout_ref.model.path),
+            "reward_sha256": _sha256_file(reward_path),
+            "bfcl_handler_sha256": handler_config.get("source_sha256"),
+            "rollout": {
+                "n": self.online_sampling_config.rollout_n,
+                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "top_p": self.config.actor_rollout_ref.rollout.top_p,
+                "top_k": self.config.actor_rollout_ref.rollout.top_k,
+                "max_response_length": self.config.data.max_response_length,
+            },
+            "online_sampling": _online_sampling_state_semantics(
+                self.online_sampling_config,
+                train_batch_size=int(self.config.data.train_batch_size),
+                gen_batch_size=int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size)),
+            ),
+        }
+        fingerprint_json = json.dumps(fingerprint, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        run_id = self.online_sampling_config.run_id or hashlib.sha256(fingerprint_json.encode()).hexdigest()[:24]
+        self.online_sampling_controller = OnlineSamplingController(
+            config=self.online_sampling_config,
+            run_id=run_id,
+            fingerprint=fingerprint,
+            sample_ids=sample_ids,
+            sample_metadata=sample_metadata,
+        )
+        logger.info(
+            "online sampling initialized: run_id=%s samples=%d state_path=%s",
+            run_id,
+            len(sample_ids),
+            self.online_sampling_config.state_path,
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -786,11 +980,15 @@ class PPOTrainer:
 
         # 4. load dataloader checkpoint
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
+        if self.train_dataloader is None:
+            logger.info("Skipping dataloader restore because online sampling owns the training order")
+        elif os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        if self.online_sampling_controller is not None:
+            self.online_sampling_controller.restore_checkpoint_snapshot("latest", self.global_steps)
 
     def _save_checkpoint(self):
         """Save actor, critic, and dataloader checkpoints to local (and optionally remote) storage."""
@@ -843,7 +1041,12 @@ class PPOTrainer:
         # save dataloader state
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        if self.train_dataloader is None:
+            torch.save({"online_sampling": True}, dataloader_local_path)
+        else:
+            torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        if self.online_sampling_controller is not None:
+            self.online_sampling_controller.save_checkpoint_snapshot("latest", self.global_steps)
 
         # write latest checkpointed iteration tracker for atomic resume
         actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
@@ -853,8 +1056,164 @@ class PPOTrainer:
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        latest_tmp = f"{local_latest_checkpointed_iteration}.tmp"
+        with open(latest_tmp, "w") as f:
             f.write(str(self.global_steps))
+        os.replace(latest_tmp, local_latest_checkpointed_iteration)
+        if self.online_sampling_controller is not None:
+            keep_values = [
+                value
+                for value in (max_actor_ckpt_to_keep, max_critic_ckpt_to_keep)
+                if isinstance(value, int) and value > 0
+            ]
+            if keep_values:
+                self.online_sampling_controller.prune_checkpoint_snapshots("latest", max(keep_values))
+
+    def _load_best_checkpoint_metadata(self) -> None:
+        config = self.config.trainer.get("best_checkpoint", {})
+        if not config.get("enabled", False):
+            return
+        best_root = Path(self.config.trainer.default_local_dir) / config.get("directory", "best_checkpoint")
+        pointer_path = best_root / "best_checkpointed_iteration.txt"
+        if not pointer_path.is_file():
+            return
+        best_step = int(pointer_path.read_text(encoding="utf-8").strip())
+        metric_path = best_root / f"global_step_{best_step}" / "best_metric.json"
+        if not metric_path.is_file():
+            raise FileNotFoundError(f"Best-checkpoint pointer has no metric metadata: {metric_path}")
+        metadata = json.loads(metric_path.read_text(encoding="utf-8"))
+        self.best_checkpoint_step = best_step
+        self.best_checkpoint_value = float(metadata["value"])
+
+    def _regular_checkpoint_path(self, step: int) -> Path:
+        return Path(self.config.trainer.default_local_dir) / f"global_step_{step}"
+
+    def _regular_checkpoint_is_complete(self, step: int) -> bool:
+        step_folder = self._regular_checkpoint_path(step)
+        required_paths = [step_folder / "actor", step_folder / "data.pt"]
+        if self.use_critic:
+            required_paths.append(step_folder / str(Role.Critic))
+        if not all(path.exists() for path in required_paths):
+            return False
+
+        pointer_path = Path(self.config.trainer.default_local_dir) / "latest_checkpointed_iteration.txt"
+        if not pointer_path.is_file():
+            return False
+        try:
+            return int(pointer_path.read_text(encoding="utf-8").strip()) == step
+        except ValueError:
+            return False
+
+    def _ensure_regular_checkpoint_for_best(self) -> Path:
+        if not self._regular_checkpoint_is_complete(self.global_steps):
+            step_folder = self._regular_checkpoint_path(self.global_steps)
+            if step_folder.exists():
+                shutil.rmtree(step_folder)
+            self._save_checkpoint()
+        if not self._regular_checkpoint_is_complete(self.global_steps):
+            raise RuntimeError(
+                f"Regular checkpoint did not complete before best-checkpoint materialization at step "
+                f"{self.global_steps}"
+            )
+        return self._regular_checkpoint_path(self.global_steps)
+
+    def _maybe_save_best_checkpoint(self, val_metrics: dict[str, float]) -> None:
+        config = self.config.trainer.get("best_checkpoint", {})
+        if not config.get("enabled", False):
+            return
+        self._validate_best_checkpoint_config()
+        metric_name = config.get("metric")
+        if not metric_name:
+            raise ValueError("trainer.best_checkpoint.metric must be configured when best checkpointing is enabled")
+        if metric_name not in val_metrics:
+            raise KeyError(f"Configured best-checkpoint metric is missing: {metric_name}")
+        mode = config.get("mode", "max")
+        if mode not in {"max", "min"}:
+            raise ValueError("trainer.best_checkpoint.mode must be 'max' or 'min'")
+        min_delta = float(config.get("min_delta", 0.0))
+        if min_delta < 0:
+            raise ValueError("trainer.best_checkpoint.min_delta must be non-negative")
+        value = float(val_metrics[metric_name])
+        if not math.isfinite(value):
+            raise ValueError(f"Best-checkpoint metric must be finite: {metric_name}={value}")
+        improved = self.best_checkpoint_value is None
+        if self.best_checkpoint_value is not None and mode == "max":
+            improved = value > self.best_checkpoint_value + min_delta
+        elif self.best_checkpoint_value is not None and mode == "min":
+            improved = value < self.best_checkpoint_value - min_delta
+        if not improved:
+            return
+
+        best_root = Path(self.config.trainer.default_local_dir) / config.get("directory", "best_checkpoint")
+        step_folder = best_root / f"global_step_{self.global_steps}"
+        staging_folder = best_root / f".global_step_{self.global_steps}.{uuid.uuid4().hex}.tmp"
+        previous_step = self.best_checkpoint_step
+        best_root.mkdir(parents=True, exist_ok=True)
+
+        self.checkpoint_manager.sleep_replicas()
+        try:
+            regular_folder = self._ensure_regular_checkpoint_for_best()
+            metric_metadata = {
+                "metric": metric_name,
+                "mode": mode,
+                "value": value,
+                "global_step": self.global_steps,
+            }
+
+            if previous_step == self.global_steps and step_folder.is_dir():
+                if self.online_sampling_controller is not None:
+                    self.online_sampling_controller.save_checkpoint_snapshot("best", self.global_steps)
+                metric_tmp = step_folder / "best_metric.json.tmp"
+                metric_tmp.write_text(json.dumps(metric_metadata, indent=2, sort_keys=True), encoding="utf-8")
+                os.replace(metric_tmp, step_folder / "best_metric.json")
+            else:
+                shutil.rmtree(staging_folder, ignore_errors=True)
+                staging_folder.mkdir(parents=True)
+                shutil.copytree(
+                    regular_folder / "actor",
+                    staging_folder / "actor",
+                    copy_function=_link_or_copy_file,
+                    symlinks=True,
+                )
+                if self.use_critic:
+                    shutil.copytree(
+                        regular_folder / str(Role.Critic),
+                        staging_folder / str(Role.Critic),
+                        copy_function=_link_or_copy_file,
+                        symlinks=True,
+                    )
+                _link_or_copy_file(str(regular_folder / "data.pt"), str(staging_folder / "data.pt"))
+                if self.online_sampling_controller is not None:
+                    self.online_sampling_controller.save_checkpoint_snapshot("best", self.global_steps)
+                (staging_folder / "best_metric.json").write_text(
+                    json.dumps(metric_metadata, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                if step_folder.exists():
+                    shutil.rmtree(step_folder)
+                os.replace(staging_folder, step_folder)
+
+            pointer_tmp = best_root / "best_checkpointed_iteration.txt.tmp"
+            pointer_tmp.write_text(str(self.global_steps), encoding="utf-8")
+            os.replace(pointer_tmp, best_root / "best_checkpointed_iteration.txt")
+        except Exception:
+            shutil.rmtree(staging_folder, ignore_errors=True)
+            raise
+        finally:
+            self.checkpoint_manager.wake_up_replicas()
+
+        self.best_checkpoint_step = self.global_steps
+        self.best_checkpoint_value = value
+        if previous_step is not None and previous_step != self.global_steps:
+            shutil.rmtree(best_root / f"global_step_{previous_step}", ignore_errors=True)
+            if self.online_sampling_controller is not None:
+                self.online_sampling_controller.delete_checkpoint_snapshot("best", previous_step)
+        logger.info(
+            "Updated best checkpoint: metric=%s value=%s step=%s",
+            metric_name,
+            value,
+            self.global_steps,
+        )
 
     def _validate(self) -> dict[str, float]:
         # Lists to collect samples for the table
@@ -1592,6 +1951,317 @@ class PPOTrainer:
         # see compute_spec_decode_metrics in verl/trainer/ppo/ray_trainer.py).
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
 
+    def _build_online_batch_dict(self, indices: np.ndarray) -> dict:
+        return collate_fn([self.train_dataset[int(index)] for index in indices])
+
+    def _dispatch_generation(self, batch_dict: dict, timing_raw: dict) -> KVBatchMeta:
+        batch_size = len(batch_dict["raw_prompt"])
+        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
+        batch_dict["__rollout_n__"] = np.full(batch_size, self.online_sampling_config.rollout_n, dtype=np.int64)
+        batch = tu.get_tensordict(batch_dict)
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        self.async_rollout_manager.generate_sequences(batch)
+
+        started = time.perf_counter()
+        batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+        timing_raw["gen"] = timing_raw.get("gen", 0.0) + time.perf_counter() - started
+        batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        self.replay_buffer.remove(batch.partition_id, batch.keys)
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            raise RuntimeError("Online sampling requires reward-loop workers; colocated reward is not supported")
+        return batch
+
+    def _extract_online_observation_groups(
+        self,
+        batch: KVBatchMeta,
+        *,
+        phase: str,
+        generation_round: int,
+    ) -> list[tuple[SampleObservation, list[str], list[dict]]]:
+        select_fields = ["uid", "sample_id", "index", "rm_scores", "extra_fields"]
+        if self.online_sampling_config.save_responses:
+            select_fields.append("responses")
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=select_fields)
+        rewards = data["rm_scores"].sum(dim=-1).tolist()
+        uids = [str(value) for value in _as_python_list(data["uid"])]
+        sample_ids = [str(value) for value in _as_python_list(data["sample_id"])]
+        dense_indices = [int(value) for value in _as_python_list(data["index"])]
+        extra_fields = _as_python_list(data["extra_fields"])
+        responses = data["responses"] if self.online_sampling_config.save_responses else None
+
+        session_final: dict[tuple[str, int], tuple[int, int]] = {}
+        prompt_keys: dict[str, list[str]] = defaultdict(list)
+        prompt_tags: dict[str, list[dict]] = defaultdict(list)
+        for position, (key, tag) in enumerate(zip(batch.keys, batch.tags, strict=True)):
+            uid, session_id, output_index = _parse_transfer_queue_key(key)
+            prompt_keys[uid].append(key)
+            prompt_tags[uid].append(tag)
+            session_key = (uid, session_id)
+            if session_key not in session_final or output_index > session_final[session_key][0]:
+                session_final[session_key] = (output_index, position)
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for (uid, session_id), (_, position) in session_final.items():
+            if uids[position] != uid:
+                raise ValueError(f"TransferQueue uid mismatch for key={batch.keys[position]}")
+            reward_extra_info = extra_fields[position].get("reward_extra_info", {})
+            if "correct" not in reward_extra_info or "format" not in reward_extra_info:
+                raise KeyError(
+                    "Online sampling reward functions must return `correct` and `format` in reward_extra_info"
+                )
+            response = None
+            if responses is not None:
+                response = self.tokenizer.decode(responses[position].tolist(), skip_special_tokens=True)
+            group = grouped.setdefault(
+                uid,
+                {
+                    "sample_id": sample_ids[position],
+                    "dense_index": dense_indices[position],
+                    "rollouts": [],
+                },
+            )
+            if group["sample_id"] != sample_ids[position] or group["dense_index"] != dense_indices[position]:
+                raise ValueError(f"Inconsistent sample metadata across rollout sessions for uid={uid}")
+            group["rollouts"].append(
+                RolloutObservation(
+                    rollout_index=session_id,
+                    reward=float(rewards[position]),
+                    correct=int(reward_extra_info["correct"]),
+                    format=int(reward_extra_info["format"]),
+                    response=response,
+                )
+            )
+
+        result = []
+        for uid, group in grouped.items():
+            observation = SampleObservation(
+                sample_id=group["sample_id"],
+                dense_index=group["dense_index"],
+                phase=phase,
+                policy_step=self.global_steps,
+                generation_round=generation_round,
+                rollouts=tuple(sorted(group["rollouts"], key=lambda item: item.rollout_index)),
+                attempt_id=uid,
+            )
+            result.append((observation, prompt_keys[uid], prompt_tags[uid]))
+        return result
+
+    def _ensure_online_step0(self) -> None:
+        if self.online_sampling_controller is None or self.online_sampling_controller.is_step0_complete():
+            return
+        pending = self.online_sampling_controller.pending_step0_indices()
+        progress = tqdm(total=len(pending), desc="Online Sampling Step 0")
+        for start in range(0, len(pending), self.online_sampling_config.probe_batch_size):
+            indices = pending[start : start + self.online_sampling_config.probe_batch_size]
+            timing_raw: dict[str, float] = {}
+            batch = self._dispatch_generation(self._build_online_batch_dict(indices), timing_raw)
+            groups = self._extract_online_observation_groups(
+                batch,
+                phase="step0",
+                generation_round=start // self.online_sampling_config.probe_batch_size,
+            )
+            if len(groups) != len(indices):
+                tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+                raise RuntimeError(
+                    f"Step 0 generated {len(groups)} complete prompt groups for {len(indices)} requested samples"
+                )
+            for observation, _, _ in groups:
+                self.online_sampling_controller.record_observation(observation)
+            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+            progress.update(len(groups))
+        progress.close()
+        sigma_scale = self.online_sampling_controller.finish_step0()
+        logger.info("Online Sampling Step 0 complete: sigma_scale=%s", sigma_scale)
+
+    def _online_step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta | None:
+        target_prompts = int(self.config.data.train_batch_size)
+        min_prompts = math.ceil(target_prompts * self.online_sampling_config.min_effective_batch_ratio)
+        attempted_indices: list[int] = []
+        accepted_groups: list[tuple[list[str], list[dict]]] = []
+        metadata_template: KVBatchMeta | None = None
+        generated_prompts = 0
+        zero_variance_prompts = 0
+        rounds_used = 0
+        db_commit_seconds = 0.0
+
+        for generation_round in range(self.online_sampling_config.max_refill_rounds):
+            need = target_prompts - len(accepted_groups)
+            if need <= 0:
+                break
+            candidate_count = (
+                int(self.config.data.get("gen_batch_size", target_prompts)) if generation_round == 0 else need
+            )
+            indices = self.online_sampling_controller.sample_indices(
+                current_step=self.global_steps,
+                generation_round=generation_round,
+                count=candidate_count,
+                exclude_indices=attempted_indices,
+            )
+            if not len(indices):
+                break
+            rounds_used += 1
+            attempted_indices.extend(indices.tolist())
+            generated_prompts += len(indices)
+            batch = self._dispatch_generation(self._build_online_batch_dict(indices), timing_raw)
+            if metadata_template is None:
+                metadata_template = batch
+            groups = self._extract_online_observation_groups(
+                batch,
+                phase="train",
+                generation_round=generation_round,
+            )
+            if len(groups) != len(indices):
+                tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+                raise RuntimeError(
+                    f"Online generation produced {len(groups)} complete prompt groups for {len(indices)} samples"
+                )
+            for observation, keys, tags in groups:
+                commit_started = time.perf_counter()
+                accepted = self.online_sampling_controller.record_observation(observation)
+                db_commit_seconds += time.perf_counter() - commit_started
+                if accepted:
+                    accepted_groups.append((keys, tags))
+                else:
+                    zero_variance_prompts += 1
+                    tq.kv_clear(keys=keys, partition_id=batch.partition_id)
+
+        effective_prompts = min(len(accepted_groups), target_prompts)
+        metrics.update(
+            {
+                "online_sampling/candidate_prompts": generated_prompts,
+                "online_sampling/effective_prompts": effective_prompts,
+                "online_sampling/zero_variance_prompts": zero_variance_prompts,
+                "online_sampling/generation_rounds": rounds_used,
+                "online_sampling/refill_rounds": max(0, rounds_used - 1),
+                "online_sampling/effective_batch_ratio": effective_prompts / target_prompts,
+                "online_sampling/db_commit_seconds": db_commit_seconds,
+                "online_sampling/priority_sigma_mean": float(self.online_sampling_controller.states.ema_sigma.mean()),
+                "online_sampling/staleness_mean": float(
+                    np.maximum(
+                        0,
+                        self.global_steps - self.online_sampling_controller.states.last_observed_step,
+                    ).mean()
+                ),
+            }
+        )
+        if len(accepted_groups) < min_prompts:
+            for keys, _ in accepted_groups:
+                tq.kv_clear(keys=keys, partition_id="train")
+            metrics["online_sampling/skipped_optimizer_step"] = 1
+            return None
+
+        metrics["online_sampling/skipped_optimizer_step"] = 0
+        for keys, _ in accepted_groups[target_prompts:]:
+            tq.kv_clear(keys=keys, partition_id="train")
+        accepted_groups = accepted_groups[:target_prompts]
+        keys = [key for group_keys, _ in accepted_groups for key in group_keys]
+        tags = [tag for _, group_tags in accepted_groups for tag in group_tags]
+        return KVBatchMeta(
+            partition_id="train",
+            keys=keys,
+            tags=tags,
+            fields=metadata_template.fields,
+            extra_info=metadata_template.extra_info,
+        )
+
+    def _optimize_generated_batch(self, batch: KVBatchMeta, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        self.checkpoint_manager.sleep_replicas()
+        if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
+            batch = self._add_remax_reward_baselines(batch)
+        batch = self._balance_batch(batch, metrics=metrics)
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            batch = self._compute_old_log_prob(batch, metrics=metrics)
+        if self.use_reference_policy:
+            with marked_timer("ref", timing_raw, color="olive"):
+                batch = self._compute_ref_log_prob(batch, metrics=metrics)
+        if self.use_critic:
+            with marked_timer("values", timing_raw, color="cyan"):
+                batch = self._compute_values(batch, metrics=metrics)
+        with marked_timer("adv", timing_raw, color="brown"):
+            batch = self._compute_advantage(batch, metrics=metrics)
+        if self.use_critic:
+            with marked_timer("update_critic", timing_raw, color="pink"):
+                batch = self._update_critic(batch, metrics=metrics)
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            with marked_timer("update_actor", timing_raw, color="red"):
+                batch = self._update_actor(batch, metrics=metrics)
+        return batch
+
+    def _fit_online(self) -> None:
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        self.global_steps += 1
+        self.prev_step_profile = False
+        self.curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        self.next_step_profile = False
+        last_val_metrics = None
+
+        while self.global_steps <= self.total_training_steps:
+            is_last_step = self.global_steps >= self.total_training_steps
+            metrics: dict[str, Any] = {}
+            timing_raw: dict[str, float] = {}
+            batch = None
+
+            self._start_profiling()
+            with marked_timer("step", timing_raw):
+                batch = self._online_step(metrics, timing_raw)
+                if batch is not None:
+                    batch = self._optimize_generated_batch(batch, metrics, timing_raw)
+
+                should_save = self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                )
+                if should_save:
+                    if batch is None:
+                        self.checkpoint_manager.sleep_replicas()
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
+                    if batch is None:
+                        self.checkpoint_manager.wake_up_replicas()
+
+                if batch is not None:
+                    with marked_timer("update_weights", timing_raw, color="red"):
+                        self.checkpoint_manager.update_weights()
+            self._stop_profiling()
+
+            if self.config.trainer.test_freq > 0 and (
+                is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+            ):
+                with marked_timer("testing", timing_raw, color="green"):
+                    val_metrics = self._validate()
+                    self._maybe_save_best_checkpoint(val_metrics)
+                    if is_last_step:
+                        last_val_metrics = val_metrics
+                metrics.update(val_metrics)
+
+            if batch is not None:
+                self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps, epoch=0)
+                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                if rollout_data_dir:
+                    self._log_rollout_data(batch, timing_raw, rollout_data_dir)
+                tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+                self.replay_buffer.remove(batch.partition_id, batch.keys)
+            else:
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": 0,
+                        "timing_s/step": timing_raw.get("step", 0.0),
+                    }
+                )
+
+            self.logger.log(data=metrics, step=self.global_steps)
+            progress_bar.update(1)
+            self.global_steps += 1
+            if is_last_step:
+                self._shutdown_dump_executor()
+                pprint(f"Final validation metrics: {last_val_metrics}")
+                progress_bar.close()
+                return
+
     def fit(self):
         if self._dump_executor._shutdown:
             self._init_dump_executor()
@@ -1609,17 +2279,26 @@ class PPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        self._load_best_checkpoint_metadata()
         self.checkpoint_manager.update_weights()
 
         # perform validation before training
+        initial_val_metrics = None
         if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            self.logger.log(data=val_metrics, step=self.global_steps)
+            initial_val_metrics = self._validate()
+            assert initial_val_metrics, f"{initial_val_metrics=}"
+            pprint(f"Initial validation metrics: {initial_val_metrics}")
+            self.logger.log(data=initial_val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
                 return
+        if self.online_sampling_controller is not None:
+            self._ensure_online_step0()
+        if initial_val_metrics is not None:
+            self._maybe_save_best_checkpoint(initial_val_metrics)
+        if self.online_sampling_controller is not None:
+            self._fit_online()
+            return
 
         current_epoch = self.global_steps // len(self.train_dataloader)
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1663,6 +2342,7 @@ class PPOTrainer:
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()
+                        self._maybe_save_best_checkpoint(val_metrics)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
@@ -1843,6 +2523,8 @@ class TaskRunner:
         finally:
             if trainer:
                 trainer.replay_buffer.close()
+                if trainer.online_sampling_controller is not None:
+                    trainer.online_sampling_controller.close()
             tq.close()
 
 

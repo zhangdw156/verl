@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "OnlineSamplingConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -54,6 +60,43 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class OnlineSamplingConfig(BaseConfig):
+    """Configuration for persistent online prompt sampling.
+
+    Args:
+        enabled: Enable Step 0 probing and online weighted sampling.
+        state_path: SQLite database used for the sample catalog and observation history.
+        run_id: Optional stable run identifier. If unset, it is derived from the run fingerprint.
+        rollout_n: Number of rollouts collected for each prompt group.
+        zero_variance_epsilon: Prompt groups at or below this reward std are post-filtered.
+        ema_alpha: Weight assigned to the newest reward std observation.
+        min_weight: Positive sampling floor applied to every eligible sample.
+        staleness_weight: Maximum additive sampling weight from staleness.
+        staleness_horizon: Number of policy steps required to reach the maximum staleness bonus.
+        max_refill_rounds: Maximum generation rounds used to fill one effective training batch.
+        min_effective_batch_ratio: Skip the optimizer update below this fraction of train_batch_size.
+        probe_batch_size: Number of prompts dispatched in each Step 0 generation batch.
+        save_responses: Persist decoded rollout responses in SQLite.
+        seed: Base seed used for deterministic weighted sampling.
+    """
+
+    enabled: bool = False
+    state_path: Optional[str] = None
+    run_id: Optional[str] = None
+    rollout_n: int = 8
+    zero_variance_epsilon: float = 1e-6
+    ema_alpha: float = 0.8
+    min_weight: float = 1e-3
+    staleness_weight: float = 0.1
+    staleness_horizon: int = 100
+    max_refill_rounds: int = 5
+    min_effective_batch_ratio: float = 0.25
+    probe_batch_size: int = 128
+    save_responses: bool = False
+    seed: int = 42
 
 
 @dataclass
@@ -658,6 +701,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    online_sampling: Optional[OnlineSamplingConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

@@ -29,6 +29,7 @@ verl is fast with:
    :caption: Quickstart
 
    start/install
+   start/cu124_uv
    start/quickstart
    start/multinode
    start/ray_debug_tutorial
@@ -83,6 +84,7 @@ verl is fast with:
    algo/otb.md
    algo/dppo.md
    algo/opd.md
+   algo/online_sampling
 
 .. toctree::
    :maxdepth: 1

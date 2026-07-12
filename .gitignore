@@ -121,6 +121,7 @@ ENV/
 
 # ckpt
 *.lock
+!requirements-cu124.lock
 
 # data
 *.parquet

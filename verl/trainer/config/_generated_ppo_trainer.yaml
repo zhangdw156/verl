@@ -802,6 +802,7 @@ algorithm:
   pf_ppo:
     reweight_method: pow
     weight_pow: 2.0
+  online_sampling: null
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
@@ -878,6 +879,12 @@ trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
+  best_checkpoint:
+    enabled: false
+    metric: null
+    mode: max
+    min_delta: 0.0
+    directory: best_checkpoint
   ray_wait_register_center_timeout: 300
   device: cuda
 global_profiler:
