@@ -85,6 +85,9 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    # Ray consumes runtime_env before TaskRunner starts, so resolve interpolations
+    # such as ${verl_meta_config.work_root} on the driver first.
+    OmegaConf.resolve(config)
     _embed_bfcl_handler_source(config)
 
     # Check if Ray is not initialized
