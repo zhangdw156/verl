@@ -268,6 +268,7 @@ class BFCLV4MultiTurnAgentLoop(AgentLoopBase):
         raw_model_results: list[list[str]] = []
         decoded_model_results: list[list[list[str]]] = []
         force_terminated = False
+        prompt_too_long = False
         decode_errors = 0
         tool_call_count = 0
         unsafe_call_count = 0
@@ -328,11 +329,12 @@ class BFCLV4MultiTurnAgentLoop(AgentLoopBase):
                     prompt_text = self.handler._format_prompt(inference_data["message"], inference_data["function"])
                     prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
                     if len(prompt_ids) > self.prompt_length:
-                        raise ValueError(
-                            f"BFCL prompt for `{entry_id}` contains {len(prompt_ids)} tokens, "
-                            f"exceeding rollout.prompt_length={self.prompt_length}. "
-                            "Increase data.max_prompt_length to preserve official BFCL context."
-                        )
+                        last_prompt_ids = list(prompt_ids[-self.prompt_length :])
+                        last_response_ids = []
+                        last_response_logprobs = None
+                        prompt_too_long = True
+                        force_terminated = True
+                        break
                     started = time.perf_counter()
                     generation = await self.server_manager.generate(
                         request_id=request_id,
@@ -408,7 +410,12 @@ class BFCLV4MultiTurnAgentLoop(AgentLoopBase):
                 if force_terminated:
                     break
 
-            if unsafe_call_count:
+            if prompt_too_long:
+                evaluation_result = {
+                    "valid": False,
+                    "error": {"error_type": "bfcl:prompt_too_long"},
+                }
+            elif unsafe_call_count:
                 evaluation_result = {
                     "valid": False,
                     "error": {"error_type": "bfcl:unsafe_function_call"},
@@ -465,6 +472,7 @@ class BFCLV4MultiTurnAgentLoop(AgentLoopBase):
                 "bfcl_tool_calls": float(tool_call_count),
                 "bfcl_decode_errors": float(decode_errors),
                 "bfcl_unsafe_calls": float(unsafe_call_count),
+                "bfcl_prompt_too_long": float(prompt_too_long),
                 "bfcl_error_type": error_type,
             },
         }

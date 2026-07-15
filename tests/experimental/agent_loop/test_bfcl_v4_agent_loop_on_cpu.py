@@ -176,6 +176,87 @@ async def test_agent_loop_preserves_official_failure_metadata():
 
 
 @pytest.mark.asyncio
+async def test_prompt_too_long_is_scored_as_zero_without_generation():
+    loop, _ = _make_loop({"valid": True})
+    loop.prompt_length = 8
+
+    output = await loop.run(
+        {"temperature": 0},
+        _verl_validate=True,
+        uid="uid",
+        bfcl_category="multi_turn_long_context",
+        bfcl_entry={
+            "id": "multi_turn_long_context_0",
+            "question": [[{"role": "user", "content": "this prompt is too long"}]],
+            "function": [{"name": "normal"}],
+            "initial_config": {},
+            "involved_classes": [],
+        },
+        reward_model={"ground_truth": [["normal()"]]},
+    )
+
+    reward_info = output.extra_fields["reward_extra_info"]
+    assert output.reward_score == 0.0
+    assert len(output.prompt_ids) == loop.prompt_length
+    assert reward_info["acc"] == 0.0
+    assert reward_info["bfcl_force_terminated"] == 1.0
+    assert reward_info["bfcl_prompt_too_long"] == 1.0
+    assert reward_info["bfcl_error_type"] == "bfcl:prompt_too_long"
+    assert loop.server_manager.responses == ["CALL", "DONE"]
+
+
+@pytest.mark.asyncio
+async def test_later_turn_prompt_too_long_resets_previous_generation_and_cleans_runtime():
+    class _LogprobQueuedServer:
+        def __init__(self):
+            self.responses = ["DONE", "UNUSED"]
+
+        async def generate(self, request_id, prompt_ids, sampling_params):
+            del request_id, prompt_ids, sampling_params
+            text = self.responses.pop(0)
+            token_ids = list(text.encode())
+            return SimpleNamespace(
+                token_ids=token_ids,
+                log_probs=[-0.1] * len(token_ids),
+                num_preempted=0,
+                extra_fields={"global_steps": 3},
+            )
+
+    loop, _ = _make_loop({"valid": True})
+    loop.prompt_length = 128
+    loop.server_manager = _LogprobQueuedServer()
+    runtime_instance = "verl_runtime_uid_multi_turn_long_context_1_state_instance"
+    setattr(loop.runtime.multi_turn_utils, runtime_instance, object())
+
+    output = await loop.run(
+        {"temperature": 0},
+        _verl_validate=True,
+        uid="uid",
+        bfcl_category="multi_turn_long_context",
+        bfcl_entry={
+            "id": "multi_turn_long_context_1",
+            "question": [
+                [{"role": "user", "content": "short"}],
+                [{"role": "user", "content": "x" * 200}],
+            ],
+            "function": [{"name": "normal"}],
+            "initial_config": {},
+            "involved_classes": [],
+        },
+        reward_model={"ground_truth": [["normal()"], ["normal()"]]},
+    )
+
+    reward_info = output.extra_fields["reward_extra_info"]
+    assert output.reward_score == 0.0
+    assert output.response_ids == [loop.tokenizer.eos_token_id]
+    assert output.response_logprobs is None
+    assert reward_info["bfcl_prompt_too_long"] == 1.0
+    assert reward_info["bfcl_error_type"] == "bfcl:prompt_too_long"
+    assert loop.server_manager.responses == ["UNUSED"]
+    assert not hasattr(loop.runtime.multi_turn_utils, runtime_instance)
+
+
+@pytest.mark.asyncio
 async def test_unsafe_call_is_rejected_without_execution():
     loop, executed = _make_loop({"valid": True})
     loop.server_manager = _QueuedServer(["UNSAFE"])

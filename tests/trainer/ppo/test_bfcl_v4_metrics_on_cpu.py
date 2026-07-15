@@ -35,6 +35,26 @@ def test_computes_official_unweighted_overall_accuracy():
     assert result["val-core/bfcl_v4_multi_turn/multi_turn_base/accuracy"] == 1.0
 
 
+def test_prompt_too_long_zero_scores_remain_in_official_overall():
+    data_sources = []
+    accuracies = []
+    for category in (
+        "multi_turn_base",
+        "multi_turn_miss_func",
+        "multi_turn_miss_param",
+    ):
+        data_sources.extend([f"bfcl_v4/{category}"] * 200)
+        accuracies.extend([1.0] * 200)
+    data_sources.extend(["bfcl_v4/multi_turn_long_context"] * 200)
+    accuracies.extend([0.0] * 29 + [1.0] * 171)
+
+    result = compute_bfcl_v4_multi_turn_metrics(data_sources, {"acc": accuracies})
+
+    assert "val-aux/bfcl_v4_multi_turn/partial/accuracy" not in result
+    assert result["val-core/bfcl_v4_multi_turn/multi_turn_long_context/accuracy"] == pytest.approx(171 / 200)
+    assert result["val-core/bfcl_v4_multi_turn/overall/accuracy"] == pytest.approx((3 + 171 / 200) / 4)
+
+
 def test_subset_is_labeled_partial():
     data_sources = [
         "bfcl_v4/multi_turn_base",
