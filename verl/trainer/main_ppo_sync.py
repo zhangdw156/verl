@@ -178,6 +178,13 @@ def _parse_transfer_queue_key(key: str) -> tuple[str, int, int]:
     return fields[0], int(fields[1]), int(fields[2])
 
 
+def _transfer_queue_entry_uid(key: str, tag: dict) -> str:
+    if tag.get("status") != "success":
+        return key
+    uid, _, _ = _parse_transfer_queue_key(key)
+    return uid
+
+
 def _online_sampling_state_semantics(
     config: OnlineSamplingConfig,
     *,
@@ -295,6 +302,7 @@ class ReplayBuffer:
     def __init__(self, poll_interval: float = 1.0):
         # partition_id => {key: tags}
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
+        self.retired_uids: dict[str, set[str]] = defaultdict(set)
 
         self.poll_interval = poll_interval
         self.lock = threading.Lock()
@@ -334,7 +342,14 @@ class ReplayBuffer:
         """
         with self.lock:
             partition = self.partitions[partition_id]
+            retired_uids = self.retired_uids[partition_id]
             for key, tags in items.items():
+                try:
+                    entry_uid = _transfer_queue_entry_uid(key, tags)
+                except (TypeError, ValueError):
+                    entry_uid = key
+                if entry_uid in retired_uids:
+                    continue
                 if key not in partition:
                     partition[key] = {}
                 partition[key].update(tags)
@@ -352,7 +367,27 @@ class ReplayBuffer:
                 if key in partition:
                     del partition[key]
 
-    def sample(self, partition_id: str, global_steps: int = None, batch_size: int = None) -> KVBatchMeta:
+    def retire(self, partition_id: str, uids: list[str] | set[str]):
+        """Discard completed prompt UIDs and ignore late polling snapshots."""
+        retired = set(uids)
+        with self.lock:
+            self.retired_uids[partition_id].update(retired)
+            partition = self.partitions[partition_id]
+            for key in list(partition):
+                try:
+                    entry_uid = _transfer_queue_entry_uid(key, partition[key])
+                except (TypeError, ValueError):
+                    entry_uid = key
+                if entry_uid in retired:
+                    del partition[key]
+
+    def sample(
+        self,
+        partition_id: str,
+        global_steps: int = None,
+        batch_size: int = None,
+        expected_uids: set[str] | None = None,
+    ) -> KVBatchMeta:
         """Sample a batch of data from the replay buffer.
 
         Args:
@@ -360,6 +395,8 @@ class ReplayBuffer:
             global_steps (int, optional): Global training steps. If not None, wait until all prompts of
                 this global steps have finished.
             batch_size (int, optional): Batch size. Defaults to None.
+            expected_uids (set[str], optional): Prompt UIDs belonging to the current
+                generation dispatch. Entries from other dispatches are ignored.
 
         Returns:
             KVBatchMeta: A batch of data.
@@ -372,20 +409,52 @@ class ReplayBuffer:
             time.sleep(self.poll_interval)
             with self.lock:
                 keys, tags = [], []
+                failed_uids: set[str] = set()
                 should_wait = False
                 partition = self.partitions[partition_id]
                 for key, tag in partition.items():
-                    if tag["global_steps"] == global_steps:
+                    try:
+                        entry_uid = _transfer_queue_entry_uid(key, tag)
+                    except (TypeError, ValueError):
+                        entry_uid = None
+                    if expected_uids is not None:
+                        if entry_uid not in expected_uids:
+                            continue
+                    if tag.get("global_steps") == global_steps:
                         if tag["status"] == "running":
                             should_wait = True
                             break
                         elif tag["status"] == "success":
                             keys.append(key)
                             tags.append(tag)
+                        elif tag["status"] == "failure":
+                            failed_uids.add(entry_uid)
                         else:
                             logger.debug(f"Unknown status {tag['status']} for key {key}")
                 if not should_wait:
-                    return KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+                    failed_output_keys = []
+                    if failed_uids:
+                        failed_output_keys = [
+                            key
+                            for key, tag in zip(keys, tags, strict=True)
+                            if _transfer_queue_entry_uid(key, tag) in failed_uids
+                        ]
+                        filtered = [
+                            (key, tag)
+                            for key, tag in zip(keys, tags, strict=True)
+                            if _transfer_queue_entry_uid(key, tag) not in failed_uids
+                        ]
+                        keys = [key for key, _ in filtered]
+                        tags = [tag for _, tag in filtered]
+                    return KVBatchMeta(
+                        partition_id=partition_id,
+                        keys=keys,
+                        tags=tags,
+                        extra_info={
+                            "failed_uids": sorted(failed_uids),
+                            "failed_output_keys": failed_output_keys,
+                        },
+                    )
 
 
 @ray.remote
@@ -1232,16 +1301,19 @@ class PPOTrainer:
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
-            batch_dict["uid"] = np.array(
-                [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
-            )
+            prompt_uids = [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))]
+            batch_dict["uid"] = np.array(prompt_uids, dtype=object)
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
             self.async_rollout_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer
-            batch = self.replay_buffer.sample(partition_id="val", global_steps=self.global_steps)
+            batch = self._sample_replay_batch(
+                partition_id="val",
+                prompt_uids=prompt_uids,
+                require_all_success=False,
+            )
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -1954,16 +2026,42 @@ class PPOTrainer:
     def _build_online_batch_dict(self, indices: np.ndarray) -> dict:
         return collate_fn([self.train_dataset[int(index)] for index in indices])
 
+    def _sample_replay_batch(
+        self,
+        partition_id: str,
+        prompt_uids: list[str],
+        *,
+        require_all_success: bool = True,
+    ) -> KVBatchMeta:
+        batch = self.replay_buffer.sample(
+            partition_id=partition_id,
+            global_steps=self.global_steps,
+            expected_uids=set(prompt_uids),
+        )
+        failed_uids = list(batch.extra_info.get("failed_uids", []))
+        failed_output_keys = list(batch.extra_info.get("failed_output_keys", []))
+        tq.kv_clear(keys=[*prompt_uids, *failed_output_keys], partition_id=partition_id)
+        self.replay_buffer.retire(partition_id, prompt_uids)
+        if require_all_success and failed_uids:
+            if batch.keys:
+                tq.kv_clear(keys=batch.keys, partition_id=partition_id)
+            raise RuntimeError(
+                f"Generation failed for {len(failed_uids)} prompts in partition {partition_id}: "
+                f"{failed_uids[:8]}"
+            )
+        return batch
+
     def _dispatch_generation(self, batch_dict: dict, timing_raw: dict) -> KVBatchMeta:
         batch_size = len(batch_dict["raw_prompt"])
-        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
+        prompt_uids = [str(uuid.uuid4()) for _ in range(batch_size)]
+        batch_dict["uid"] = np.array(prompt_uids, dtype=object)
         batch_dict["__rollout_n__"] = np.full(batch_size, self.online_sampling_config.rollout_n, dtype=np.int64)
         batch = tu.get_tensordict(batch_dict)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
         self.async_rollout_manager.generate_sequences(batch)
 
         started = time.perf_counter()
-        batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+        batch = self._sample_replay_batch(partition_id="train", prompt_uids=prompt_uids)
         timing_raw["gen"] = timing_raw.get("gen", 0.0) + time.perf_counter() - started
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.replay_buffer.remove(batch.partition_id, batch.keys)
@@ -1982,8 +2080,13 @@ class PPOTrainer:
         if self.online_sampling_config.save_responses:
             select_fields.append("responses")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=select_fields)
-        rewards = data["rm_scores"].sum(dim=-1).tolist()
         uids = [str(value) for value in _as_python_list(data["uid"])]
+        if len(uids) != len(batch.keys):
+            raise RuntimeError(
+                f"TransferQueue returned {len(uids)} rows for {len(batch.keys)} keys "
+                f"in partition {batch.partition_id}"
+            )
+        rewards = data["rm_scores"].sum(dim=-1).tolist()
         sample_ids = [str(value) for value in _as_python_list(data["sample_id"])]
         dense_indices = [int(value) for value in _as_python_list(data["index"])]
         extra_fields = _as_python_list(data["extra_fields"])
@@ -2003,7 +2106,10 @@ class PPOTrainer:
         grouped: dict[str, dict[str, Any]] = {}
         for (uid, session_id), (_, position) in session_final.items():
             if uids[position] != uid:
-                raise ValueError(f"TransferQueue uid mismatch for key={batch.keys[position]}")
+                raise ValueError(
+                    f"TransferQueue uid mismatch for key={batch.keys[position]}: "
+                    f"expected={uid!r}, actual={uids[position]!r}"
+                )
             reward_extra_info = extra_fields[position].get("reward_extra_info", {})
             if "correct" not in reward_extra_info or "format" not in reward_extra_info:
                 raise KeyError(
@@ -2373,7 +2479,8 @@ class PPOTrainer:
 
     def step(self, batch_dict: dict, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # 1. put batch to agent loop manager
-        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
+        prompt_uids = [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))]
+        batch_dict["uid"] = np.array(prompt_uids, dtype=object)
         if self.config.algorithm.adv_estimator == core_algos.AdvantageEstimator.REMAX:
             rollout_n = self.config.actor_rollout_ref.rollout.n
             sampled_batch_dict = batch_dict.copy()
@@ -2381,11 +2488,13 @@ class PPOTrainer:
             sampled_batch_dict["__rollout_n__"] = np.full(len(batch_dict["raw_prompt"]), rollout_n, dtype=np.int64)
 
             baseline_batch_dict = batch_dict.copy()
-            baseline_batch_dict["uid"] = np.array([f"remax_baseline_{uid}" for uid in batch_dict["uid"]], dtype=object)
+            baseline_uids = [f"remax_baseline_{uid}" for uid in prompt_uids]
+            baseline_batch_dict["uid"] = np.array(baseline_uids, dtype=object)
             baseline_batch_dict["__do_sample__"] = np.zeros(len(batch_dict["raw_prompt"]), dtype=bool)
             baseline_batch_dict["__rollout_n__"] = np.ones(len(batch_dict["raw_prompt"]), dtype=np.int64)
 
             batch = torch.cat([tu.get_tensordict(sampled_batch_dict), tu.get_tensordict(baseline_batch_dict)], dim=0)
+            prompt_uids.extend(baseline_uids)
         else:
             batch = tu.get_tensordict(batch_dict)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
@@ -2393,7 +2502,7 @@ class PPOTrainer:
 
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
-            batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
+            batch = self._sample_replay_batch(partition_id="train", prompt_uids=prompt_uids)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
 
